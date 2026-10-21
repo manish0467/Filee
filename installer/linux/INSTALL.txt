@@ -2,10 +2,28 @@ Run ./Filee to test the extracted app, or ./filee-cli help for the command line.
 
 Run ./install.sh to install for the current user. It requires Python 3, creates
 an application launcher and ~/.local/bin/filee, and does not require root.
+Run ./install.sh --upgrade to safely upgrade an existing installation in place
+without uninstalling. Your settings, presets, history, and downloaded conversion
+engines are kept. Running without --upgrade refuses to overwrite an existing installation.
 Run ./uninstall.sh to remove this installation and Filee-downloaded engines.
 Your settings and converted files are kept. If integration cleanup fails, the
 installation is kept so you can fix the error and run the uninstaller again.
-An existing installation is never overwritten; uninstall it before replacing it.
+
+Upgrade reliability and crash recovery:
+The upgrade procedure prepares files on the same filesystem and replaces the
+installation using atomic rename steps with an automatic rollback trap. If an error
+or signal interruption occurs during the swap, the previous version is restored.
+Note: While each individual directory rename is atomic in POSIX, the two-step swap
+(moving the old installation aside, then moving the new version into place) is not
+a single atomic transaction. In the event of uncatchable termination (SIGKILL) or
+sudden hardware power loss during the brief window between steps, automatic traps
+cannot execute; the previous installation is safely preserved in .backup-<pid>.
+To recover manually:
+- If the application directory does not exist:
+    mv ~/.local/share/filee/.backup-<pid> ~/.local/share/filee/application
+- If a partial or invalid application directory already exists:
+    Inspect and remove or rename ~/.local/share/filee/application first, then run:
+    mv ~/.local/share/filee/.backup-<pid> ~/.local/share/filee/application
 
 The .NET runtime is bundled; its native system libraries are still required.
 On Ubuntu 24.04, install the desktop and runtime dependencies with:

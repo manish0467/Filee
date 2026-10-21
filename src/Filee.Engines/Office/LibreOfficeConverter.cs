@@ -15,6 +15,8 @@
 //    converts a tiny file once per worker profile in the background. --terminate_after_init alone doesn't help.
 //  * soffice reports no progress: ProgressEstimate keeps the progress ring moving while it runs.
 
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using Filee.Core.Conversion;
 using Filee.Core.Formats;
 using Filee.Engines.Infrastructure;
@@ -89,9 +91,48 @@ public sealed class LibreOfficeConverter : IConverter
         return _soffice is null
             ? EngineStatus.Unavailable("engine.reason.not_installed")
             : !EngineEnvironment.UsesFileesCopy("libreoffice")
-                ? EngineStatus.Available(_soffice, _hasHwpFilter ? "H2Orestart" : null)
+                ? EngineStatus.Available(_soffice, VersionOf(_soffice) + (_hasHwpFilter ? " · H2Orestart" : ""))
                 : EngineStatus.Available(_soffice, EngineVersions.Component("libreoffice")
                                                    + (_hasHwpFilter ? $" · H2Orestart {EngineVersions.Component("h2orestart")}" : ""));
+    }
+
+    private static readonly ConcurrentDictionary<string, string> Versions = new();
+
+    private static string VersionOf(string soffice) =>
+        Versions.GetOrAdd($"{soffice}|{SafeLastWriteTicks(soffice)}", _ =>
+        {
+            try
+            {
+                using var process = Process.Start(new ProcessStartInfo(soffice, "--version")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                });
+                if (process is null) return "LibreOffice";
+                if (!process.WaitForExit(3000))
+                {
+                    process.Kill(entireProcessTree: true);
+                    return "LibreOffice";
+                }
+                if (process.ExitCode != 0) return "LibreOffice";
+                var line = process.StandardOutput.ReadLine()?.Trim();
+                if (string.IsNullOrWhiteSpace(line)) return "LibreOffice";
+                return line.StartsWith("LibreOffice", StringComparison.OrdinalIgnoreCase)
+                    ? line
+                    : (char.IsDigit(line[0]) || line.StartsWith('v') || line.StartsWith('V') ? $"LibreOffice {line}" : "LibreOffice");
+            }
+            catch
+            {
+                return "LibreOffice";
+            }
+        });
+
+    private static long SafeLastWriteTicks(string path)
+    {
+        try { return File.GetLastWriteTimeUtc(path).Ticks; }
+        catch { return 0; }
     }
 
     public async Task<IReadOnlyList<string>> ConvertAsync(ConversionStep step, IProgress<double>? progress, CancellationToken cancellationToken)

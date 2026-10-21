@@ -1,5 +1,9 @@
+using System.Diagnostics;
+using System.Formats.Tar;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -247,7 +251,7 @@ public class UpdateServiceTests
     public async Task Update_installs_the_release_that_is_latest_now_not_the_one_found_earlier()
     {
         // An earlier check found 9.9.9; 9.9.10 came out before Update was pressed.
-        var updates = new UpdateService(NullLogger<UpdateService>.Instance, new LatestRelease("v9.9.10"));
+        var updates = new UpdateService(NullLogger<UpdateService>.Instance, new LatestRelease("v9.9.10")) { TargetPlatform = "win" };
         updates.UseRelease(new UpdateService.ReleaseFile("Filee-9.9.9-win-Setup.exe", Base + "Filee-9.9.9-win-Setup.exe", 1),
             new UpdateService.ReleaseFile("Filee-9.9.9-SHA256SUMS.txt", Base + "Filee-9.9.9-SHA256SUMS.txt", 1));
         var announced = 0;
@@ -282,5 +286,511 @@ public class UpdateServiceTests
     {
         Assert.EndsWith("/releases/latest", UpdateService.LatestReleaseUrl);
         Assert.StartsWith(UpdateService.RepositoryUrl.TrimEnd('/'), UpdateService.LatestReleaseUrl);
+    }
+
+    [Theory]
+    [InlineData(Architecture.X64, "linux-x64")]
+    [InlineData(Architecture.Arm64, "linux-arm64")]
+    public void Architecture_maps_to_linux_rid(Architecture arch, string expectedRid) =>
+        Assert.Equal(expectedRid, UpdateService.GetLinuxRid(arch));
+
+    [Theory]
+    [InlineData(Architecture.Arm)]
+    [InlineData(Architecture.S390x)]
+    [InlineData(Architecture.Wasm)]
+    public void Architecture_unsupported_throws(Architecture arch) =>
+        Assert.Throws<PlatformNotSupportedException>(() => UpdateService.GetLinuxRid(arch));
+
+    [Fact]
+    public void IsLinuxInstalled_checks_marker_file()
+    {
+        var folder = TempFolder();
+        Assert.False(UpdateService.IsLinuxInstalled(folder));
+
+        var marker = Path.Combine(folder, ".filee-package");
+        File.WriteAllText(marker, "com.filee.app\n");
+        Assert.True(UpdateService.IsLinuxInstalled(folder));
+
+        File.WriteAllText(marker, "org.other.app");
+        Assert.False(UpdateService.IsLinuxInstalled(folder));
+    }
+
+    [Fact]
+    public void FindFiles_selects_linux_assets_for_specific_rid()
+    {
+        using var release = JsonDocument.Parse($$"""
+            {"tag_name": "v1.2.3", "assets": [
+              {"name": "Filee-1.2.3-SHA256SUMS.txt", "size": 100, "browser_download_url": "{{Base}}Filee-1.2.3-SHA256SUMS.txt"},
+              {"name": "Filee-1.2.3-win-Setup.exe", "size": 1200, "browser_download_url": "{{Base}}Filee-1.2.3-win-Setup.exe"},
+              {"name": "Filee-1.2.3-linux-x64.tar.gz", "size": 2000, "browser_download_url": "{{Base}}Filee-1.2.3-linux-x64.tar.gz"},
+              {"name": "Filee-1.2.3-linux-x64-SHA256SUMS.txt", "size": 90, "browser_download_url": "{{Base}}Filee-1.2.3-linux-x64-SHA256SUMS.txt"},
+              {"name": "Filee-1.2.3-linux-arm64.tar.gz", "size": 1900, "browser_download_url": "{{Base}}Filee-1.2.3-linux-arm64.tar.gz"},
+              {"name": "Filee-1.2.3-linux-arm64-SHA256SUMS.txt", "size": 92, "browser_download_url": "{{Base}}Filee-1.2.3-linux-arm64-SHA256SUMS.txt"}
+            ]}
+            """);
+
+        var (installerX64, sumsX64) = UpdateService.FindFiles(release.RootElement, "linux-x64");
+        Assert.Equal("Filee-1.2.3-linux-x64.tar.gz", installerX64?.Name);
+        Assert.Equal("Filee-1.2.3-linux-x64-SHA256SUMS.txt", sumsX64?.Name);
+
+        var (installerArm64, sumsArm64) = UpdateService.FindFiles(release.RootElement, "linux-arm64");
+        Assert.Equal("Filee-1.2.3-linux-arm64.tar.gz", installerArm64?.Name);
+        Assert.Equal("Filee-1.2.3-linux-arm64-SHA256SUMS.txt", sumsArm64?.Name);
+
+        var (installerWin, sumsWin) = UpdateService.FindFiles(release.RootElement, "win");
+        Assert.Equal("Filee-1.2.3-win-Setup.exe", installerWin?.Name);
+        Assert.Equal("Filee-1.2.3-SHA256SUMS.txt", sumsWin?.Name);
+    }
+
+    [Fact]
+    public async Task Checksum_file_for_different_artifact_is_rejected()
+    {
+        var installerData = RandomNumberGenerator.GetBytes(1000);
+        var hash = Sha256(installerData);
+        var folder = TempFolder();
+
+        var updates = new UpdateService(NullLogger<UpdateService>.Instance, new FakeLinuxRelease(
+            installerData, hash, sumsArtifact: "Filee-1.2.3-linux-arm64.tar.gz"));
+        updates.UseRelease(
+            new UpdateService.ReleaseFile("Filee-1.2.3-linux-x64.tar.gz", Base + "Filee-1.2.3-linux-x64.tar.gz", installerData.Length),
+            new UpdateService.ReleaseFile("Filee-1.2.3-linux-x64-SHA256SUMS.txt", Base + "Filee-1.2.3-linux-x64-SHA256SUMS.txt", 100));
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            updates.DownloadInstallerAsync(folder, null, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public void ExtractLinuxArchive_valid_payload_extracts_and_sets_permissions()
+    {
+        var folder = TempFolder();
+        var archiveFile = Path.Combine(folder, "package.tar.gz");
+        var destFolder = Path.Combine(folder, "extracted");
+
+        var tarBytes = CreateTarGz(writer =>
+        {
+            AddFileEntry(writer, "Filee-1.0.0-linux-x64/Filee", "#!/bin/sh\necho app\n");
+            AddFileEntry(writer, "Filee-1.0.0-linux-x64/install.sh", "#!/bin/sh\necho installer\n");
+            AddFileEntry(writer, "Filee-1.0.0-linux-x64/filee.png", "fake png data");
+        });
+        File.WriteAllBytes(archiveFile, tarBytes);
+
+        var payloadDir = UpdateService.ExtractLinuxArchive(archiveFile, destFolder);
+
+        Assert.Equal(Path.Combine(destFolder, "Filee-1.0.0-linux-x64"), payloadDir);
+        var installSh = Path.Combine(payloadDir, "install.sh");
+        var fileeExe = Path.Combine(payloadDir, "Filee");
+        Assert.True(File.Exists(installSh));
+        Assert.True(File.Exists(fileeExe));
+
+        if (OperatingSystem.IsLinux())
+        {
+            var installMode = File.GetUnixFileMode(installSh);
+            Assert.True((installMode & UnixFileMode.UserExecute) != 0, "install.sh must be executable");
+            var fileeMode = File.GetUnixFileMode(fileeExe);
+            Assert.True((fileeMode & UnixFileMode.UserExecute) != 0, "Filee must be executable");
+        }
+    }
+
+    [Fact]
+    public void ExtractLinuxArchive_rejects_path_traversal()
+    {
+        var folder = TempFolder();
+        var archiveFile = Path.Combine(folder, "traversal.tar.gz");
+        var destFolder = Path.Combine(folder, "extracted");
+
+        var tarBytes = CreateTarGz(writer =>
+        {
+            AddFileEntry(writer, "../evil.sh", "#!/bin/sh\n");
+        });
+        File.WriteAllBytes(archiveFile, tarBytes);
+
+        Assert.Throws<InvalidDataException>(() => UpdateService.ExtractLinuxArchive(archiveFile, destFolder));
+    }
+
+    [Fact]
+    public void ExtractLinuxArchive_rejects_absolute_path()
+    {
+        var folder = TempFolder();
+        var archiveFile = Path.Combine(folder, "absolute.tar.gz");
+        var destFolder = Path.Combine(folder, "extracted");
+
+        var tarBytes = CreateTarGz(writer =>
+        {
+            AddFileEntry(writer, "/tmp/evil.sh", "#!/bin/sh\n");
+        });
+        File.WriteAllBytes(archiveFile, tarBytes);
+
+        Assert.Throws<InvalidDataException>(() => UpdateService.ExtractLinuxArchive(archiveFile, destFolder));
+    }
+
+    [Fact]
+    public void ExtractLinuxArchive_rejects_escaping_symlink()
+    {
+        var folder = TempFolder();
+        var archiveFile = Path.Combine(folder, "symlink.tar.gz");
+        var destFolder = Path.Combine(folder, "extracted");
+
+        var tarBytes = CreateTarGz(writer =>
+        {
+            AddSymlinkEntry(writer, "Filee-1.0.0/escape_link", "/etc/passwd");
+        });
+        File.WriteAllBytes(archiveFile, tarBytes);
+
+        Assert.Throws<InvalidDataException>(() => UpdateService.ExtractLinuxArchive(archiveFile, destFolder));
+    }
+
+    [Fact]
+    public void ExtractLinuxArchive_rejects_missing_payload_files()
+    {
+        var folder = TempFolder();
+        var archiveFile = Path.Combine(folder, "missing.tar.gz");
+        var destFolder = Path.Combine(folder, "extracted");
+
+        var tarBytes = CreateTarGz(writer =>
+        {
+            AddFileEntry(writer, "Filee-1.0.0/filee.png", "png data");
+        });
+        File.WriteAllBytes(archiveFile, tarBytes);
+
+        Assert.Throws<InvalidDataException>(() => UpdateService.ExtractLinuxArchive(archiveFile, destFolder));
+    }
+
+    [AvaloniaFact]
+    public async Task UpdateAsync_on_linux_downloads_extracts_and_invokes_installer_with_upgrade_and_restart()
+    {
+        var tarBytes = CreateTarGz(writer =>
+        {
+            AddFileEntry(writer, "Filee-9.9.9-linux-x64/Filee", "#!/bin/sh\nexit 0\n");
+            AddFileEntry(writer, "Filee-9.9.9-linux-x64/install.sh", "#!/bin/sh\nexit 0\n");
+            AddFileEntry(writer, "Filee-9.9.9-linux-x64/filee.png", "png data");
+        });
+        var hash = Sha256(tarBytes);
+        var network = new FakeLinuxRelease(tarBytes, hash, "Filee-9.9.9-linux-x64.tar.gz", "9.9.9");
+
+        var mockInstallDir = TempFolder();
+        File.WriteAllText(Path.Combine(mockInstallDir, ".filee-version"), "9.9.9");
+
+        var updates = new UpdateService(NullLogger<UpdateService>.Instance, network)
+        {
+            InstallsItself = true,
+            TargetPlatform = "linux-x64",
+            LinuxInstallDirectoryOverride = mockInstallDir,
+        };
+        updates.UseRelease(
+            new UpdateService.ReleaseFile("Filee-9.9.9-linux-x64.tar.gz", Base + "Filee-9.9.9-linux-x64.tar.gz", tarBytes.Length),
+            new UpdateService.ReleaseFile("Filee-9.9.9-linux-x64-SHA256SUMS.txt", Base + "Filee-9.9.9-linux-x64-SHA256SUMS.txt", 100));
+
+        var processes = new List<ProcessStartInfo>();
+        var shutdownRequested = false;
+        updates.RequestApplicationShutdown = () => shutdownRequested = true;
+        updates.StartProcess = psi =>
+        {
+            processes.Add(psi);
+            return Process.Start(new ProcessStartInfo("true") { UseShellExecute = false });
+        };
+
+        await updates.UpdateAsync();
+
+        Assert.Equal(UpdateStep.Idle, updates.Step);
+        Assert.True(processes.Count >= 2);
+
+        var installerPsi = processes[0];
+        Assert.Equal("/bin/sh", installerPsi.FileName);
+        Assert.Equal(3, installerPsi.ArgumentList.Count);
+        Assert.EndsWith("install.sh", installerPsi.ArgumentList[0]);
+        Assert.Equal("--upgrade", installerPsi.ArgumentList[1]);
+        Assert.Equal("--restart", installerPsi.ArgumentList[2]);
+        Assert.Equal("1", installerPsi.Environment["FILEE_IN_APP_UPDATE"]);
+        Assert.Equal(installerPsi.WorkingDirectory, Path.GetDirectoryName(installerPsi.ArgumentList[0]));
+
+        var restartPsi = processes[1];
+        Assert.Equal("/bin/sh", restartPsi.FileName);
+        Assert.Equal("-c", restartPsi.ArgumentList[0]);
+        Assert.Contains("kill -0", restartPsi.ArgumentList[1]);
+        Assert.Equal(Environment.ProcessId.ToString(), restartPsi.ArgumentList[3]);
+        Assert.Equal(Path.Combine(mockInstallDir, "Filee"), restartPsi.ArgumentList[4]);
+        Assert.Equal(mockInstallDir, restartPsi.WorkingDirectory);
+        Assert.False(restartPsi.Environment.ContainsKey("FILEE_IN_APP_UPDATE"));
+
+        Assert.True(shutdownRequested, "Application shutdown must be requested after verified installation");
+    }
+
+    [AvaloniaFact]
+    public async Task UpdateAsync_on_linux_handles_installer_failure()
+    {
+        var tarBytes = CreateTarGz(writer =>
+        {
+            AddFileEntry(writer, "Filee-9.9.9-linux-x64/Filee", "#!/bin/sh\nexit 0\n");
+            AddFileEntry(writer, "Filee-9.9.9-linux-x64/install.sh", "#!/bin/sh\nexit 0\n");
+            AddFileEntry(writer, "Filee-9.9.9-linux-x64/filee.png", "png data");
+        });
+        var hash = Sha256(tarBytes);
+        var network = new FakeLinuxRelease(tarBytes, hash, "Filee-9.9.9-linux-x64.tar.gz", "9.9.9");
+
+        var mockInstallDir = TempFolder();
+        var backupDir = Path.Combine(Path.GetDirectoryName(mockInstallDir)!, ".backup-123");
+        Directory.CreateDirectory(backupDir);
+
+        var updates = new UpdateService(NullLogger<UpdateService>.Instance, network)
+        {
+            InstallsItself = true,
+            TargetPlatform = "linux-x64",
+            LinuxInstallDirectoryOverride = mockInstallDir,
+        };
+        updates.UseRelease(
+            new UpdateService.ReleaseFile("Filee-9.9.9-linux-x64.tar.gz", Base + "Filee-9.9.9-linux-x64.tar.gz", tarBytes.Length),
+            new UpdateService.ReleaseFile("Filee-9.9.9-linux-x64-SHA256SUMS.txt", Base + "Filee-9.9.9-linux-x64-SHA256SUMS.txt", 100));
+
+        var failedCount = 0;
+        updates.UpdateFailed += (_, _) => failedCount++;
+
+        var shutdownRequested = false;
+        updates.RequestApplicationShutdown = () => shutdownRequested = true;
+
+        updates.StartProcess = psi =>
+            Process.Start(new ProcessStartInfo("false") { UseShellExecute = false });
+
+        await updates.UpdateAsync();
+
+        Assert.Equal(UpdateStep.Failed, updates.Step);
+        Assert.Equal(1, failedCount);
+        Assert.NotNull(updates.LastError);
+        Assert.Contains("Installer ended with exit code 1", updates.LastError.Message);
+        Assert.Contains("mv '" + backupDir + "' '" + mockInstallDir + "'", updates.LastError.Message);
+        Assert.False(shutdownRequested, "Application shutdown must not be requested when installer fails");
+    }
+
+    [Fact]
+    public void ExtractLinuxArchive_rejects_symlink_component_traversal()
+    {
+        var outsideFolder = TempFolder();
+        var sentinelFile = Path.Combine(outsideFolder, "sentinel.txt");
+        File.WriteAllText(sentinelFile, "SENTINEL_UNTOUCHED");
+
+        var stagingFolder = TempFolder();
+        var archiveFile = Path.Combine(stagingFolder, "evil-traversal.tar.gz");
+        var destFolder = Path.Combine(stagingFolder, "dest");
+
+        var tarBytes = CreateTarGz(writer =>
+        {
+            // Adversarial entry 1: directory symlink pointing outside to outsideFolder
+            AddSymlinkEntry(writer, "payload/escape", outsideFolder);
+            // Adversarial entry 2: file inside escape pointing to sentinel.txt
+            AddFileEntry(writer, "payload/escape/sentinel.txt", "MALICIOUS_OVERWRITE");
+        });
+        File.WriteAllBytes(archiveFile, tarBytes);
+
+        Assert.Throws<InvalidDataException>(() => UpdateService.ExtractLinuxArchive(archiveFile, destFolder));
+        Assert.Equal("SENTINEL_UNTOUCHED", File.ReadAllText(sentinelFile));
+    }
+
+    [Fact]
+    public void ExtractLinuxArchive_rejects_link_order_attack()
+    {
+        var stagingFolder = TempFolder();
+        var archiveFile = Path.Combine(stagingFolder, "evil-link-order.tar.gz");
+        var destFolder = Path.Combine(stagingFolder, "dest");
+
+        var tarBytes = CreateTarGz(writer =>
+        {
+            // Entry 1: regular directory
+            var dirEntry = new PaxTarEntry(TarEntryType.Directory, "payload/sub");
+            writer.WriteEntry(dirEntry);
+            // Entry 2: attempt to replace directory with a symlink
+            AddSymlinkEntry(writer, "payload/sub", "other");
+        });
+        File.WriteAllBytes(archiveFile, tarBytes);
+
+        Assert.Throws<InvalidDataException>(() => UpdateService.ExtractLinuxArchive(archiveFile, destFolder));
+    }
+
+    [Fact]
+    public void CreateSecureWorkspace_creates_private_unshared_directory()
+    {
+        var workspace = UpdateService.CreateSecureWorkspace();
+        try
+        {
+            Assert.True(Directory.Exists(workspace));
+            var dirInfo = new DirectoryInfo(workspace);
+            Assert.Null(dirInfo.LinkTarget);
+            Assert.False(dirInfo.Attributes.HasFlag(FileAttributes.ReparsePoint));
+
+            if (OperatingSystem.IsLinux())
+            {
+                var mode = File.GetUnixFileMode(workspace);
+                Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, mode);
+            }
+        }
+        finally
+        {
+            UpdateService.DeleteSecureWorkspace(workspace);
+            Assert.False(Directory.Exists(workspace));
+        }
+    }
+
+    [Fact]
+    public void DeleteSecureWorkspace_refuses_to_follow_symlink()
+    {
+        var realDir = TempFolder();
+        var targetFile = Path.Combine(realDir, "important.txt");
+        File.WriteAllText(targetFile, "CRITICAL_DATA");
+
+        var linkContainer = TempFolder();
+        var symlinkPath = Path.Combine(linkContainer, "link-to-real");
+        File.CreateSymbolicLink(symlinkPath, realDir);
+
+        UpdateService.DeleteSecureWorkspace(symlinkPath);
+
+        Assert.True(Directory.Exists(realDir), "Real directory must not be deleted when DeleteSecureWorkspace is called on a symlink");
+        Assert.True(File.Exists(targetFile), "File inside real directory must survive");
+    }
+
+    [Fact]
+    public async Task Concurrent_secure_workspaces_are_isolated()
+    {
+        var tasks = Enumerable.Range(0, 5).Select(_ => Task.Run(() => UpdateService.CreateSecureWorkspace())).ToArray();
+        var workspaces = await Task.WhenAll(tasks);
+
+        try
+        {
+            Assert.Equal(5, workspaces.Distinct().Count());
+            Assert.All(workspaces, w => Assert.True(Directory.Exists(w)));
+        }
+        finally
+        {
+            foreach (var w in workspaces)
+                UpdateService.DeleteSecureWorkspace(w);
+        }
+    }
+
+    [Fact]
+    public void VerifyInstalledVersion_detects_mismatch()
+    {
+        var folder = TempFolder();
+        File.WriteAllText(Path.Combine(folder, ".filee-version"), "1.0.0");
+
+        Assert.True(UpdateService.VerifyInstalledVersion(folder, "1.0.0", out var actual));
+        Assert.Equal("1.0.0", actual);
+
+        Assert.False(UpdateService.VerifyInstalledVersion(folder, "1.0.2", out actual));
+        Assert.Equal("1.0.0", actual);
+
+        var emptyFolder = TempFolder();
+        Assert.False(UpdateService.VerifyInstalledVersion(emptyFolder, "1.0.0", out actual));
+        Assert.Null(actual);
+    }
+
+    [AvaloniaFact]
+    public async Task UpdateAsync_on_linux_fails_when_installed_version_does_not_match()
+    {
+        var tarBytes = CreateTarGz(writer =>
+        {
+            AddFileEntry(writer, "Filee-9.9.9-linux-x64/Filee", "#!/bin/sh\nexit 0\n");
+            AddFileEntry(writer, "Filee-9.9.9-linux-x64/install.sh", "#!/bin/sh\nexit 0\n");
+            AddFileEntry(writer, "Filee-9.9.9-linux-x64/filee.png", "png data");
+        });
+        var hash = Sha256(tarBytes);
+        var network = new FakeLinuxRelease(tarBytes, hash, "Filee-9.9.9-linux-x64.tar.gz", "9.9.9");
+
+        var mockInstallDir = TempFolder();
+        File.WriteAllText(Path.Combine(mockInstallDir, ".filee-version"), "1.0.0"); // Mismatch: expecting 9.9.9
+
+        var updates = new UpdateService(NullLogger<UpdateService>.Instance, network)
+        {
+            InstallsItself = true,
+            TargetPlatform = "linux-x64",
+            LinuxInstallDirectoryOverride = mockInstallDir,
+        };
+        updates.UseRelease(
+            new UpdateService.ReleaseFile("Filee-9.9.9-linux-x64.tar.gz", Base + "Filee-9.9.9-linux-x64.tar.gz", tarBytes.Length),
+            new UpdateService.ReleaseFile("Filee-9.9.9-linux-x64-SHA256SUMS.txt", Base + "Filee-9.9.9-linux-x64-SHA256SUMS.txt", 100));
+
+        var failedCount = 0;
+        updates.UpdateFailed += (_, _) => failedCount++;
+
+        var shutdownRequested = false;
+        updates.RequestApplicationShutdown = () => shutdownRequested = true;
+
+        updates.StartProcess = psi =>
+            Process.Start(new ProcessStartInfo("true") { UseShellExecute = false });
+
+        await updates.UpdateAsync();
+
+        Assert.Equal(UpdateStep.Failed, updates.Step);
+        Assert.Equal(1, failedCount);
+        Assert.NotNull(updates.LastError);
+        Assert.Contains("Update verification failed", updates.LastError.Message);
+        Assert.False(shutdownRequested, "Application shutdown must not be requested when version verification fails");
+    }
+
+    private static byte[] CreateTarGz(Action<TarWriter> populate)
+    {
+        using var mem = new MemoryStream();
+        using (var gzip = new GZipStream(mem, CompressionMode.Compress, leaveOpen: true))
+        using (var writer = new TarWriter(gzip, TarEntryFormat.Pax, leaveOpen: true))
+        {
+            populate(writer);
+        }
+        return mem.ToArray();
+    }
+
+    private static void AddFileEntry(TarWriter writer, string name, string content, UnixFileMode mode = UnixFileMode.UserRead | UnixFileMode.UserWrite)
+    {
+        var bytes = Encoding.UTF8.GetBytes(content);
+        var entry = new PaxTarEntry(TarEntryType.RegularFile, name)
+        {
+            DataStream = new MemoryStream(bytes),
+            Mode = mode,
+        };
+        writer.WriteEntry(entry);
+    }
+
+    private static void AddSymlinkEntry(TarWriter writer, string name, string target)
+    {
+        var entry = new PaxTarEntry(TarEntryType.SymbolicLink, name)
+        {
+            LinkName = target,
+        };
+        writer.WriteEntry(entry);
+    }
+
+    private sealed class FakeLinuxRelease(byte[] archive, string hash, string sumsArtifact = "Filee-9.9.9-linux-x64.tar.gz", string version = "9.9.9") : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var url = request.RequestUri!.ToString();
+            if (url.EndsWith("/releases/latest", StringComparison.Ordinal))
+            {
+                var json = $$"""
+                    {"tag_name":"v{{version}}","assets":[
+                      {"name":"Filee-{{version}}-linux-x64.tar.gz","browser_download_url":"{{Base}}Filee-{{version}}-linux-x64.tar.gz","size":{{archive.Length}}},
+                      {"name":"Filee-{{version}}-linux-x64-SHA256SUMS.txt","browser_download_url":"{{Base}}Filee-{{version}}-linux-x64-SHA256SUMS.txt","size":100}]}
+                    """;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(json, Encoding.UTF8, "application/json"),
+                });
+            }
+            if (url.Contains("/releases?per_page=", StringComparison.Ordinal) || url.EndsWith("/releases", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("[]", Encoding.UTF8, "application/json"),
+                });
+            }
+            if (url.EndsWith("SHA256SUMS.txt", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent($"{hash}  {sumsArtifact}\n", Encoding.ASCII),
+                });
+            }
+            if (url.EndsWith(".tar.gz", StringComparison.Ordinal))
+            {
+                Assert.Contains("application/octet-stream", request.Headers.Accept.ToString());
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(archive) });
+            }
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        }
     }
 }

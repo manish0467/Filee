@@ -5,8 +5,11 @@
 
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Formats.Tar;
+using System.IO.Compression;
 using System.Net.Http.Headers;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Avalonia.Threading;
@@ -84,11 +87,68 @@ public sealed partial class UpdateService : ObservableObject
     public const string WebsiteUrl = "https://filee.sh/";
 
     /// <summary>
-    /// True when this copy was installed by Setup (Inno Setup puts its uninstaller next to Filee.exe). Only then can
-    /// the new installer update it in place; the portable zip and a copy run from source have no uninstaller.
+    /// True when this copy was installed by Setup on Windows (Inno Setup puts unins000.exe next to Filee.exe)
+    /// or by install.sh on Linux (.filee-package marker containing com.filee.app).
+    /// Only then can the new installer update it in place; the portable zip and a copy run from source have no uninstaller.
     /// </summary>
-    public static bool IsInstalled { get; } = OperatingSystem.IsWindows()
-                                              && File.Exists(Path.Combine(AppContext.BaseDirectory, "unins000.exe"));
+    public static bool IsInstalled { get; } =
+        OperatingSystem.IsWindows() && File.Exists(Path.Combine(AppContext.BaseDirectory, "unins000.exe"))
+        || OperatingSystem.IsLinux() && IsLinuxInstalled(AppContext.BaseDirectory);
+
+    internal static bool IsLinuxInstalled(string baseDirectory)
+    {
+        var marker = Path.Combine(baseDirectory, ".filee-package");
+        try
+        {
+            return File.Exists(marker) && File.ReadAllText(marker).Trim() == "com.filee.app";
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Returns the RID for the current Linux process architecture ("linux-x64" or "linux-arm64").</summary>
+    internal static string GetLinuxRid() => GetLinuxRid(RuntimeInformation.ProcessArchitecture);
+
+    /// <summary>Maps <paramref name="architecture"/> to supported Linux RIDs or throws <see cref="PlatformNotSupportedException"/>.</summary>
+    internal static string GetLinuxRid(Architecture architecture) =>
+        architecture switch
+        {
+            Architecture.X64 => "linux-x64",
+            Architecture.Arm64 => "linux-arm64",
+            var arch => throw new PlatformNotSupportedException($"Unsupported Linux architecture: {arch}"),
+        };
+
+    /// <summary>Target platform for release assets ("win", "linux-x64", "linux-arm64"). Tests can override this.</summary>
+    internal string TargetPlatform { get; set; } = DefaultTargetPlatform();
+
+    private static string DefaultTargetPlatform()
+    {
+        if (OperatingSystem.IsWindows())
+            return "win";
+        if (OperatingSystem.IsLinux())
+        {
+            try
+            {
+                return GetLinuxRid();
+            }
+            catch (PlatformNotSupportedException)
+            {
+                return "unsupported";
+            }
+        }
+        return "unsupported";
+    }
+
+    /// <summary>Starts an external process. Tests can override this to intercept installer execution.</summary>
+    internal Func<ProcessStartInfo, Process?> StartProcess { get; set; } = psi => Process.Start(psi);
+
+    /// <summary>Invoked after a successful in-app update to gracefully exit the running application.</summary>
+    internal Action? RequestApplicationShutdown { get; set; }
+
+    /// <summary>Allows tests to redirect Linux installation target directory to an isolated temporary folder.</summary>
+    internal string? LinuxInstallDirectoryOverride { get; set; }
 
     /// <summary>Whether <see cref="UpdateAsync"/> installs by itself (<see cref="IsInstalled"/>; tests set it).</summary>
     internal bool InstallsItself { get; init; } = IsInstalled;
@@ -160,7 +220,9 @@ public sealed partial class UpdateService : ObservableObject
             using var json = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
             var tag = json.RootElement.TryGetProperty("tag_name", out var value) ? value.GetString() : null;
             var newer = IsNewer(tag, CurrentVersion) ? Normalize(tag!) : null;
-            (_installer, _checksums) = FindFiles(json.RootElement);
+            (_installer, _checksums) = TargetPlatform != "unsupported"
+                ? FindFiles(json.RootElement, TargetPlatform)
+                : (null, null);
             IReadOnlyList<ReleaseNote> notes = [];
             if (newer is not null)
             {
@@ -261,14 +323,17 @@ public sealed partial class UpdateService : ObservableObject
         }
 
         string installer;
+        string? workspace = null;
         try
         {
+            workspace = CreateSecureWorkspace();
             var progress = new Progress<int>(percent => DownloadPercent = percent);
-            installer = await DownloadInstallerAsync(Path.Combine(Path.GetTempPath(), "Filee-update"), progress);
+            installer = await DownloadInstallerAsync(workspace, progress);
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException
                                        or InvalidDataException or UnauthorizedAccessException)
         {
+            DeleteSecureWorkspace(workspace);
             Fail("download", ex);
             return;
         }
@@ -276,16 +341,53 @@ public sealed partial class UpdateService : ObservableObject
         Process? setup;
         try
         {
-            setup = Process.Start(new ProcessStartInfo(installer, InstallerArguments) { UseShellExecute = true });
+            if (TargetPlatform == "win")
+            {
+                setup = StartProcess(new ProcessStartInfo(installer, InstallerArguments) { UseShellExecute = true });
+            }
+            else if (TargetPlatform.StartsWith("linux-", StringComparison.OrdinalIgnoreCase))
+            {
+                var stagingDir = Path.Combine(workspace, "payload");
+                string payloadDir;
+                try
+                {
+                    Directory.CreateDirectory(stagingDir);
+                    payloadDir = ExtractLinuxArchive(installer, stagingDir);
+                }
+                catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
+                {
+                    DeleteSecureWorkspace(workspace);
+                    Fail("extract", ex);
+                    return;
+                }
+
+                var scriptPath = Path.Combine(payloadDir, "install.sh");
+                var startInfo = new ProcessStartInfo("/bin/sh")
+                {
+                    WorkingDirectory = payloadDir,
+                    UseShellExecute = false,
+                };
+                startInfo.ArgumentList.Add(scriptPath);
+                startInfo.ArgumentList.Add("--upgrade");
+                startInfo.ArgumentList.Add("--restart");
+                startInfo.Environment["FILEE_IN_APP_UPDATE"] = "1";
+                setup = StartProcess(startInfo);
+            }
+            else
+            {
+                throw new PlatformNotSupportedException("In-app update is only supported on Windows and Linux");
+            }
         }
-        catch (Win32Exception ex) when (ex.NativeErrorCode == ErrorCancelled)
+        catch (Win32Exception ex) when (TargetPlatform == "win" && ex.NativeErrorCode == ErrorCancelled)
         {
             _log.LogInformation("Update cancelled at the administrator prompt");
             Step = UpdateStep.Cancelled;
+            DeleteSecureWorkspace(workspace);
             return;
         }
-        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or PlatformNotSupportedException)
         {
+            DeleteSecureWorkspace(workspace);
             Fail("start", ex);
             return;
         }
@@ -296,11 +398,78 @@ public sealed partial class UpdateService : ObservableObject
             return;
 
         // A successful update closes Filee before Setup exits, so getting here means Setup ended without updating:
-        // the administrator prompt was declined (Setup asks for it itself), or the user cancelled.
+        // the administrator prompt was declined (Setup asks for it itself), or the user cancelled, or an error occurred.
         using (setup)
+        {
             await setup.WaitForExitAsync();
-        _log.LogInformation("Installer ended with exit code {Code}", setup.ExitCode);
-        Step = setup.ExitCode == 0 ? UpdateStep.Idle : UpdateStep.Cancelled;
+            _log.LogInformation("Installer ended with exit code {Code}", setup.ExitCode);
+            if (setup.ExitCode == 0)
+            {
+                if (TargetPlatform.StartsWith("linux-", StringComparison.OrdinalIgnoreCase))
+                {
+                    var targetInstallDir = LinuxInstallDirectoryOverride ?? GetLinuxInstallDirectory();
+                    var expectedVersion = LatestVersion;
+                    if (string.IsNullOrWhiteSpace(expectedVersion))
+                    {
+                        var fileName = Path.GetFileName(installer);
+                        var parts = fileName.Split('-');
+                        if (parts.Length >= 2 && TryParse(parts[1], out var parsedVer))
+                            expectedVersion = parsedVer.ToString(3);
+                        expectedVersion ??= "";
+                    }
+                    if (!VerifyInstalledVersion(targetInstallDir, expectedVersion, out var actualVersion))
+                    {
+                        var recovery = FindLinuxRecoveryInfo(targetInstallDir);
+                        var message = $"Update verification failed: installed version '{actualVersion ?? "unknown"}' does not match expected version '{expectedVersion}'. {recovery}";
+                        _log.LogError("{Message}", message);
+                        DeleteSecureWorkspace(workspace);
+                        Fail("verify", new InvalidOperationException(message));
+                        return;
+                    }
+                    // Success on Linux: spawn detached restart watcher and shut down current instance.
+                    try
+                    {
+                        var newExe = Path.Combine(targetInstallDir, "Filee");
+                        var currentPid = Environment.ProcessId;
+                        var restartWatcher = new ProcessStartInfo("/bin/sh")
+                        {
+                            WorkingDirectory = targetInstallDir,
+                            UseShellExecute = false,
+                        };
+                        restartWatcher.ArgumentList.Add("-c");
+                        restartWatcher.ArgumentList.Add("for _ in $(seq 1 600); do if ! kill -0 \"$1\" 2>/dev/null; then exec \"$2\"; fi; sleep 0.1; done; exit 1");
+                        restartWatcher.ArgumentList.Add("_");
+                        restartWatcher.ArgumentList.Add(currentPid.ToString());
+                        restartWatcher.ArgumentList.Add(newExe);
+                        restartWatcher.Environment.Remove("FILEE_IN_APP_UPDATE");
+                        StartProcess(restartWatcher);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "Failed to launch restart watcher for {Version}", expectedVersion);
+                    }
+                    RequestApplicationShutdown?.Invoke();
+                }
+                Step = UpdateStep.Idle;
+                DeleteSecureWorkspace(workspace);
+            }
+            else if (TargetPlatform == "win")
+            {
+                Step = UpdateStep.Cancelled;
+                DeleteSecureWorkspace(workspace);
+            }
+            else
+            {
+                var targetInstallDir = LinuxInstallDirectoryOverride ?? GetLinuxInstallDirectory();
+                var recovery = FindLinuxRecoveryInfo(targetInstallDir);
+                var message = string.IsNullOrEmpty(recovery)
+                    ? $"Installer ended with exit code {setup.ExitCode}"
+                    : $"Installer ended with exit code {setup.ExitCode}. {recovery}";
+                _log.LogError("{Message}", message);
+                DeleteSecureWorkspace(workspace);
+                Fail("install", new InvalidOperationException(message));
+            }
+        }
     }
 
     /// <summary>
@@ -330,6 +499,7 @@ public sealed partial class UpdateService : ObservableObject
             TryDelete(old);
 
         var partial = target + ".part";
+        TryDelete(partial);
         await DownloadAsync(installer, partial, progress, cancellationToken);
         var actual = await Sha256Async(partial, cancellationToken);
         if (actual != expected)
@@ -393,6 +563,9 @@ public sealed partial class UpdateService : ObservableObject
         }
     }
 
+    /// <summary>Last error encountered by <see cref="UpdateAsync"/>.</summary>
+    internal Exception? LastError { get; private set; }
+
     /// <summary>
     /// Raised on the UI thread when an installed copy could not download or start the new installer. The app says so
     /// and, once the user presses OK, opens <see cref="WebsiteUrl"/> (<see cref="OpenDownloadPage"/>).
@@ -401,6 +574,7 @@ public sealed partial class UpdateService : ObservableObject
 
     private void Fail(string stage, Exception ex)
     {
+        LastError = ex;
         _log.LogWarning(ex, "In-app update failed ({Stage})", stage);
         Step = UpdateStep.Failed;
         UpdateFailed?.Invoke(this, EventArgs.Empty);
@@ -420,12 +594,18 @@ public sealed partial class UpdateService : ObservableObject
     /// <summary>A file attached to a release.</summary>
     internal sealed record ReleaseFile(string Name, string Url, long Size);
 
-    /// <summary>Picks the Windows installer and the checksum file from a GitHub release (null when missing).</summary>
-    internal static (ReleaseFile? Installer, ReleaseFile? Checksums) FindFiles(JsonElement release)
+    /// <summary>Picks the installer/archive and checksum file matching the target platform from a GitHub release (null when missing).</summary>
+    internal static (ReleaseFile? Installer, ReleaseFile? Checksums) FindFiles(JsonElement release, string? target = "win")
     {
+        target ??= "win";
         ReleaseFile? installer = null, checksums = null;
         if (!release.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
             return (null, null);
+
+        var isLinux = target.StartsWith("linux-", StringComparison.OrdinalIgnoreCase);
+        var expectedInstallerSuffix = isLinux ? $"-{target}.tar.gz" : "-win-Setup.exe";
+        var expectedChecksumsSuffix = isLinux ? $"-{target}-SHA256SUMS.txt" : "-SHA256SUMS.txt";
+
         foreach (var asset in assets.EnumerateArray())
         {
             var name = asset.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
@@ -433,12 +613,254 @@ public sealed partial class UpdateService : ObservableObject
             var size = asset.TryGetProperty("size", out var s) && s.TryGetInt64(out var bytes) ? bytes : 0;
             if (name.Length == 0 || !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 continue;
-            if (name.EndsWith("-win-Setup.exe", StringComparison.OrdinalIgnoreCase))
+
+            if (name.EndsWith(expectedInstallerSuffix, StringComparison.OrdinalIgnoreCase))
+            {
                 installer = new ReleaseFile(name, url, size);
-            else if (name.EndsWith("-SHA256SUMS.txt", StringComparison.OrdinalIgnoreCase))
+            }
+            else if (name.EndsWith(expectedChecksumsSuffix, StringComparison.OrdinalIgnoreCase))
+            {
+                // When targeting Windows, exclude platform-specific checksum files (e.g. -linux-x64-SHA256SUMS.txt, -osx-...)
+                if (!isLinux && (name.Contains("-linux-", StringComparison.OrdinalIgnoreCase) || name.Contains("-osx-", StringComparison.OrdinalIgnoreCase)))
+                    continue;
+
                 checksums = new ReleaseFile(name, url, size);
+            }
         }
         return (installer, checksums);
+    }
+
+    /// <summary>
+    /// Extracts a Linux release archive (.tar.gz) into <paramref name="destinationDirectory"/> with security validation
+    /// (rejecting path traversal, absolute paths, unsafe entry types, directory symlinks, and escaping/component symlinks).
+    /// Returns the path to the extracted payload folder containing <c>install.sh</c>.
+    /// </summary>
+    internal static string ExtractLinuxArchive(string archivePath, string destinationDirectory)
+    {
+        if (!File.Exists(archivePath))
+            throw new FileNotFoundException("Archive file not found", archivePath);
+
+        var fullDestRoot = Path.GetFullPath(destinationDirectory);
+        if (!fullDestRoot.EndsWith(Path.DirectorySeparatorChar))
+            fullDestRoot += Path.DirectorySeparatorChar;
+
+        Directory.CreateDirectory(fullDestRoot);
+
+        using (var fileStream = File.OpenRead(archivePath))
+        using (var gzipStream = new GZipStream(fileStream, CompressionMode.Decompress))
+        using (var tarReader = new TarReader(gzipStream))
+        {
+            while (tarReader.GetNextEntry() is { } entry)
+            {
+                if (entry.EntryType is TarEntryType.GlobalExtendedAttributes or TarEntryType.ExtendedAttributes)
+                    continue;
+
+                if (string.IsNullOrWhiteSpace(entry.Name))
+                    throw new InvalidDataException("Archive contains an entry with an empty name.");
+
+                if (Path.IsPathRooted(entry.Name) || entry.Name.StartsWith('/') || entry.Name.StartsWith('\\') || entry.Name.Contains('\\'))
+                    throw new InvalidDataException($"Archive entry '{entry.Name}' has an invalid or rooted path.");
+
+                var destinationPath = Path.GetFullPath(Path.Combine(fullDestRoot, entry.Name));
+                if (!destinationPath.StartsWith(fullDestRoot, StringComparison.Ordinal))
+                    throw new InvalidDataException($"Archive entry '{entry.Name}' attempts path traversal outside destination.");
+
+                // Validate that no ancestor directory component between fullDestRoot and destinationPath is a symlink on disk
+                ValidateNoSymlinkComponents(fullDestRoot, destinationPath);
+
+                switch (entry.EntryType)
+                {
+                    case TarEntryType.Directory:
+                        if (Path.Exists(destinationPath))
+                        {
+                            var info = new DirectoryInfo(destinationPath);
+                            if (info.LinkTarget is not null || info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                                throw new InvalidDataException($"Archive entry '{entry.Name}' conflicts with an existing symbolic link.");
+                        }
+                        Directory.CreateDirectory(destinationPath);
+                        break;
+
+                    case TarEntryType.RegularFile:
+                    case TarEntryType.V7RegularFile:
+                        if (Directory.Exists(destinationPath))
+                            throw new InvalidDataException($"Archive entry '{entry.Name}' conflicts with an existing directory.");
+
+                        var parentDir = Path.GetDirectoryName(destinationPath);
+                        if (!string.IsNullOrEmpty(parentDir))
+                            Directory.CreateDirectory(parentDir);
+
+                        // If destinationPath already exists and is a symlink, delete it rather than writing through it
+                        if (Path.Exists(destinationPath))
+                        {
+                            var existingInfo = new FileInfo(destinationPath);
+                            if (existingInfo.LinkTarget is not null || existingInfo.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                                File.Delete(destinationPath);
+                        }
+
+                        entry.ExtractToFile(destinationPath, overwrite: true);
+
+                        if (OperatingSystem.IsLinux())
+                        {
+                            var mode = entry.Mode;
+                            mode |= UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                            File.SetUnixFileMode(destinationPath, mode);
+                        }
+                        break;
+
+                    case TarEntryType.SymbolicLink:
+                        if (string.IsNullOrWhiteSpace(entry.LinkName)
+                            || Path.IsPathRooted(entry.LinkName)
+                            || entry.LinkName.StartsWith('/')
+                            || entry.LinkName.StartsWith('\\')
+                            || entry.LinkName.Contains('\\'))
+                        {
+                            throw new InvalidDataException($"Tar symlink '{entry.Name}' has an invalid target '{entry.LinkName}'.");
+                        }
+
+                        var linkParent = Path.GetDirectoryName(destinationPath)!;
+                        var linkTarget = Path.GetFullPath(Path.Combine(linkParent, entry.LinkName));
+                        if (!linkTarget.StartsWith(fullDestRoot, StringComparison.Ordinal))
+                        {
+                            throw new InvalidDataException($"Tar symlink '{entry.Name}' points outside destination directory: '{entry.LinkName}'.");
+                        }
+
+                        // Directory symlinks are disallowed to prevent symlink-component traversal and link-order attacks
+                        if (Directory.Exists(linkTarget))
+                        {
+                            throw new InvalidDataException($"Tar symlink '{entry.Name}' points to a directory, which is prohibited.");
+                        }
+
+                        if (Directory.Exists(destinationPath))
+                            throw new InvalidDataException($"Archive symlink '{entry.Name}' conflicts with an existing directory.");
+
+                        if (!string.IsNullOrEmpty(linkParent))
+                            Directory.CreateDirectory(linkParent);
+
+                        if (Path.Exists(destinationPath))
+                            File.Delete(destinationPath);
+
+                        File.CreateSymbolicLink(destinationPath, entry.LinkName);
+                        break;
+
+                    case TarEntryType.HardLink:
+                        if (string.IsNullOrWhiteSpace(entry.LinkName)
+                            || Path.IsPathRooted(entry.LinkName)
+                            || entry.LinkName.StartsWith('/')
+                            || entry.LinkName.StartsWith('\\')
+                            || entry.LinkName.Contains('\\'))
+                        {
+                            throw new InvalidDataException($"Tar hard link '{entry.Name}' has an invalid target '{entry.LinkName}'.");
+                        }
+
+                        var hardTarget = Path.GetFullPath(Path.Combine(fullDestRoot, entry.LinkName));
+                        if (!hardTarget.StartsWith(fullDestRoot, StringComparison.Ordinal))
+                        {
+                            throw new InvalidDataException($"Tar hard link '{entry.Name}' points outside destination directory: '{entry.LinkName}'.");
+                        }
+
+                        if (Directory.Exists(hardTarget))
+                        {
+                            throw new InvalidDataException($"Tar hard link '{entry.Name}' points to a directory, which is prohibited.");
+                        }
+
+                        if (!File.Exists(hardTarget))
+                        {
+                            throw new InvalidDataException($"Tar hard link '{entry.Name}' target '{entry.LinkName}' does not exist.");
+                        }
+
+                        if (Directory.Exists(destinationPath))
+                            throw new InvalidDataException($"Archive hard link '{entry.Name}' conflicts with an existing directory.");
+
+                        var hardParent = Path.GetDirectoryName(destinationPath);
+                        if (!string.IsNullOrEmpty(hardParent))
+                            Directory.CreateDirectory(hardParent);
+
+                        if (Path.Exists(destinationPath))
+                            File.Delete(destinationPath);
+
+                        File.Copy(hardTarget, destinationPath, overwrite: true);
+                        break;
+
+                    default:
+                        throw new InvalidDataException($"Unsupported or unsafe tar entry type '{entry.EntryType}' for entry '{entry.Name}'.");
+                }
+            }
+        }
+
+        var rootTrimmed = Path.TrimEndingDirectorySeparator(fullDestRoot);
+        string payloadDir;
+        if (File.Exists(Path.Combine(rootTrimmed, "install.sh")))
+        {
+            payloadDir = rootTrimmed;
+        }
+        else
+        {
+            var candidates = Directory.GetDirectories(rootTrimmed)
+                .Where(d => File.Exists(Path.Combine(d, "install.sh")))
+                .ToList();
+            if (candidates.Count == 1)
+            {
+                payloadDir = candidates[0];
+            }
+            else
+            {
+                throw new InvalidDataException("Archive does not contain a single valid Filee payload with install.sh");
+            }
+        }
+
+        var installSh = Path.Combine(payloadDir, "install.sh");
+        var fileeExe = Path.Combine(payloadDir, "Filee");
+        if (!File.Exists(installSh) || !File.Exists(fileeExe))
+        {
+            throw new InvalidDataException("Archive is missing install.sh or Filee executable in the payload directory.");
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            EnsureExecutable(installSh);
+            EnsureExecutable(fileeExe);
+            var cli = Path.Combine(payloadDir, "filee-cli");
+            if (File.Exists(cli))
+                EnsureExecutable(cli);
+            var uninstall = Path.Combine(payloadDir, "uninstall.sh");
+            if (File.Exists(uninstall))
+                EnsureExecutable(uninstall);
+        }
+
+        return payloadDir;
+    }
+
+    /// <summary>
+    /// Verifies that no intermediate directory component between <paramref name="rootPath"/> and <paramref name="targetPath"/> is a symbolic link.
+    /// </summary>
+    private static void ValidateNoSymlinkComponents(string rootPath, string targetPath)
+    {
+        var current = rootPath.TrimEnd(Path.DirectorySeparatorChar);
+        var relative = Path.GetRelativePath(current, targetPath);
+        var segments = relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+
+        for (var i = 0; i < segments.Length - 1; i++)
+        {
+            current = Path.Combine(current, segments[i]);
+            if (Path.Exists(current))
+            {
+                var dirInfo = new DirectoryInfo(current);
+                if (dirInfo.LinkTarget is not null || dirInfo.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                {
+                    throw new InvalidDataException($"Archive path component '{segments[i]}' in '{relative}' is a symbolic link.");
+                }
+            }
+        }
+    }
+
+    private static void EnsureExecutable(string path)
+    {
+        if (OperatingSystem.IsLinux() && File.Exists(path))
+        {
+            var mode = File.GetUnixFileMode(path);
+            mode |= UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+            File.SetUnixFileMode(path, mode);
+        }
     }
 
     /// <summary>Finds the hash for <paramref name="fileName"/> in a <c>sha256sum</c>-style file ("hash  name" lines).</summary>
@@ -472,6 +894,195 @@ public sealed partial class UpdateService : ObservableObject
         {
             _log.LogInformation("Could not delete {Path}: {Message}", path, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Creates a private, dedicated temporary workspace for this update instance.
+    /// Mode 0700 on Unix, inaccessible to other local users, non-predictable, and never reusing pre-existing paths.
+    /// </summary>
+    internal static string CreateSecureWorkspace(string? baseDir = null)
+    {
+        if (string.IsNullOrWhiteSpace(baseDir))
+        {
+            baseDir = Path.GetTempPath();
+            if (OperatingSystem.IsLinux())
+            {
+                var runtimeDir = Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR");
+                if (!string.IsNullOrWhiteSpace(runtimeDir) && Directory.Exists(runtimeDir))
+                    baseDir = runtimeDir;
+            }
+        }
+
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+            var candidate = Path.Combine(baseDir, $"filee-update-{Environment.ProcessId}-{token}");
+            if (Path.Exists(candidate))
+                continue;
+
+            if (OperatingSystem.IsLinux())
+            {
+                Directory.CreateDirectory(candidate, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                File.SetUnixFileMode(candidate, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+            else
+            {
+                Directory.CreateDirectory(candidate);
+            }
+
+            var dirInfo = new DirectoryInfo(candidate);
+            if (dirInfo.LinkTarget is not null || dirInfo.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            {
+                throw new InvalidOperationException($"Secure workspace candidate '{candidate}' is a symbolic link.");
+            }
+
+            return candidate;
+        }
+
+        throw new IOException("Failed to create a unique secure workspace directory after multiple attempts.");
+    }
+
+    /// <summary>Safely deletes a secure workspace directory created by this update, refusing to follow symlinks.</summary>
+    internal static void DeleteSecureWorkspace(string? workspacePath)
+    {
+        if (string.IsNullOrWhiteSpace(workspacePath) || !Path.Exists(workspacePath))
+            return;
+
+        var dirInfo = new DirectoryInfo(workspacePath);
+        if (dirInfo.LinkTarget is not null || dirInfo.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            return;
+
+        try
+        {
+            Directory.Delete(workspacePath, recursive: true);
+        }
+        catch
+        {
+            // Best effort cleanup
+        }
+    }
+
+    /// <summary>Locates the installation directory on Linux.</summary>
+    internal static string GetLinuxInstallDirectory()
+    {
+        var overrideDir = Environment.GetEnvironmentVariable("FILEE_INSTALL_DIR");
+        if (!string.IsNullOrWhiteSpace(overrideDir))
+            return overrideDir;
+        if (IsLinuxInstalled(AppContext.BaseDirectory))
+            return AppContext.BaseDirectory;
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "filee", "application");
+    }
+
+    /// <summary>Reads the installed Filee version from the specified installation folder.</summary>
+    internal static string? GetInstalledVersion(string installDir)
+    {
+        var dll = Path.Combine(installDir, "Filee.dll");
+        if (File.Exists(dll))
+        {
+            try
+            {
+                var info = FileVersionInfo.GetVersionInfo(dll);
+                if (!string.IsNullOrWhiteSpace(info.ProductVersion))
+                    return info.ProductVersion.Split('+')[0].Trim();
+                if (!string.IsNullOrWhiteSpace(info.FileVersion))
+                    return info.FileVersion.Trim();
+            }
+            catch
+            {
+                // Fall through
+            }
+        }
+
+        var exe = Path.Combine(installDir, "Filee");
+        if (File.Exists(exe))
+        {
+            try
+            {
+                var info = FileVersionInfo.GetVersionInfo(exe);
+                if (!string.IsNullOrWhiteSpace(info.ProductVersion))
+                    return info.ProductVersion.Split('+')[0].Trim();
+                if (!string.IsNullOrWhiteSpace(info.FileVersion))
+                    return info.FileVersion.Trim();
+            }
+            catch
+            {
+                // Fall through
+            }
+        }
+
+        var cli = Path.Combine(installDir, "filee-cli");
+        if (File.Exists(cli))
+        {
+            try
+            {
+                using var proc = Process.Start(new ProcessStartInfo(cli, "version")
+                {
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                });
+                if (proc is not null && proc.WaitForExit(3000) && proc.ExitCode == 0)
+                {
+                    var line = proc.StandardOutput.ReadLine()?.Trim();
+                    if (line?.StartsWith("filee ", StringComparison.OrdinalIgnoreCase) == true)
+                        return line["filee ".Length..].Trim();
+                }
+            }
+            catch
+            {
+                // Fall through
+            }
+        }
+
+        var marker = Path.Combine(installDir, ".filee-version");
+        if (File.Exists(marker))
+        {
+            try
+            {
+                return File.ReadAllText(marker).Trim();
+            }
+            catch
+            {
+                // Fall through
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>Verifies that the version installed in <paramref name="installDir"/> matches <paramref name="expectedVersion"/>.</summary>
+    internal static bool VerifyInstalledVersion(string installDir, string expectedVersion, out string? actualVersion)
+    {
+        actualVersion = GetInstalledVersion(installDir);
+        if (actualVersion is null)
+            return false;
+
+        if (TryParse(expectedVersion, out var expected) && TryParse(actualVersion, out var actual))
+            return expected == actual;
+
+        return string.Equals(actualVersion.Trim(), expectedVersion.Trim(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string FindLinuxRecoveryInfo(string installDir)
+    {
+        var parent = Path.GetDirectoryName(installDir);
+        if (string.IsNullOrWhiteSpace(parent) || !Directory.Exists(parent))
+            return "";
+
+        try
+        {
+            var backups = Directory.GetDirectories(parent, ".backup-*");
+            if (backups.Length > 0)
+            {
+                var latestBackup = backups.OrderByDescending(Directory.GetCreationTimeUtc).First();
+                return $"Previous installation retained at '{latestBackup}'. To recover manually: mv '{latestBackup}' '{installDir}'";
+            }
+        }
+        catch
+        {
+            // Ignore directory enumeration failures
+        }
+
+        return "No backup directory found.";
     }
 
     /// <summary>True when release tag <paramref name="tag"/> ("v1.2.0") is a higher version than <paramref name="current"/>.</summary>

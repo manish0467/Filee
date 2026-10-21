@@ -3,6 +3,8 @@
 // transparent background (through PDF the page would be drawn on white paper). Everything else (EPS → JPG,
 // SVG → EPS, …) is planned through PDF or PNG by the route planner.
 
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using Filee.Core.Conversion;
 using Filee.Engines.Infrastructure;
 using Filee.Engines.Magick;
@@ -46,10 +48,52 @@ public sealed class GhostscriptConverter : IConverter, IImageTransformer
         new("ps", "png"),
     ];
 
+    private static readonly ConcurrentDictionary<string, string> Versions = new();
+
     public EngineStatus GetStatus()
     {
         _executable = Locate();
-        return _executable is null ? EngineStatus.Unavailable("engine.reason.not_installed") : EngineStatus.Available(_executable, EngineEnvironment.UsesFileesCopy("ghostscript") ? EngineVersions.Component("ghostscript") : null);
+        return _executable is null
+            ? EngineStatus.Unavailable("engine.reason.not_installed")
+            : EngineStatus.Available(_executable, EngineEnvironment.UsesFileesCopy("ghostscript")
+                ? EngineVersions.Component("ghostscript")
+                : VersionOf(_executable));
+    }
+
+    private static string? VersionOf(string gs) =>
+        Versions.GetOrAdd($"{gs}|{SafeLastWriteTicks(gs)}", _ =>
+        {
+            try
+            {
+                using var process = Process.Start(new ProcessStartInfo(gs, "--version")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                });
+                if (process is null) return "Ghostscript";
+                if (!process.WaitForExit(3000))
+                {
+                    process.Kill(entireProcessTree: true);
+                    return "Ghostscript";
+                }
+                if (process.ExitCode != 0) return "Ghostscript";
+                var line = process.StandardOutput.ReadLine()?.Trim();
+                return !string.IsNullOrWhiteSpace(line) && (char.IsDigit(line[0]) || line.StartsWith('v') || line.StartsWith('V'))
+                    ? $"Ghostscript {line}"
+                    : "Ghostscript";
+            }
+            catch
+            {
+                return "Ghostscript";
+            }
+        });
+
+    private static long SafeLastWriteTicks(string path)
+    {
+        try { return File.GetLastWriteTimeUtc(path).Ticks; }
+        catch { return 0; }
     }
 
     public async Task<IReadOnlyList<string>> ConvertAsync(ConversionStep step, IProgress<double>? progress, CancellationToken cancellationToken)
